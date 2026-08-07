@@ -192,8 +192,13 @@ fn sample_accretion_disk(pos: vec3<f32>, vel: vec3<f32>) -> vec4<f32> {
     var color = blackbody(effective_temp);
     color *= beaming_factor * grav_shift * 3.8;
 
-    let corona_color = mix(color * 0.4, vec3<f32>(0.6, 0.8, 1.0), 0.5);
-    let final_color = mix(color, corona_color, corona_density / (total_density + 0.0001));
+    // --- Thomson Scattering & Polarization Halo ---
+    let scattering_albedo = 0.75;
+    let scattering_phase = 0.85 + 0.25 * pow(max(0.0, dot(normalize(pitched_pos), -pitched_vel)), 2.0);
+    let scattered_light = mix(color * 0.5, vec3<f32>(0.5, 0.75, 1.0) * 2.5, 0.6) * scattering_phase * scattering_albedo;
+
+    let corona_color = mix(color * 0.4, scattered_light, 0.7);
+    let final_color = mix(color, corona_color, corona_density / (total_density + 0.001));
 
     return vec4<f32>(final_color * total_density, total_density * 0.45);
 }
