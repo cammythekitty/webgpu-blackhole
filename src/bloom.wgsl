@@ -81,6 +81,21 @@ fn fs_vertical_blur(in: VOut) -> @location(0) vec4<f32> {
 @group(0) @binding(3) var bloom_texture: texture_2d<f32>;
 @group(0) @binding(4) var screen_sampler: sampler;
 
+// Global-image tile info for the composite pass. Effects that are properties
+// of the WHOLE final image (vignette, film grain) need to know where this
+// tile sits within the full image, not just its own local [0,1] uv -- 
+// otherwise every tile gets its own independent vignette/grain centered on
+// itself, producing a visible grid of vignette "cells" across tiled
+// screenshots. Effects that sample neighboring texels within this tile's own
+// textures (chromatic aberration, ghost flares, streaks) are correctly
+// tile-local and don't use this.
+// Defaults to offset=(0,0), scale=(1,1) for normal (non-tiled) rendering.
+struct CompositeGlobalInfo {
+    global_offset: vec2<f32>,
+    global_scale: vec2<f32>,
+};
+@group(0) @binding(5) var<uniform> global_info: CompositeGlobalInfo;
+
 @fragment
 fn fs_composite(in: VOut) -> @location(0) vec4<f32> {
     // 1. Chromatic Aberration (Subtle color channel separation)
@@ -119,13 +134,22 @@ fn fs_composite(in: VOut) -> @location(0) vec4<f32> {
 
     let combined = scene + (bloom * 0.7) + streak;
 
-    // 4. Vignetting (Darker corners)
-    let uv_dist = length(center_uv);
+    // Global position of this fragment within the FULL final image, in
+    // [0,1] uv space. Equals in.uv for normal non-tiled rendering.
+    let global_uv = in.uv * global_info.global_scale + global_info.global_offset;
+
+    // 4. Vignetting (Darker corners) -- computed from global position so
+    // tiled renders get one vignette across the whole image, not one per tile.
+    let global_center_uv = global_uv - vec2<f32>(0.5);
+    let uv_dist = length(global_center_uv);
     let vignette = clamp(1.0 - uv_dist * uv_dist * 1.2, 0.0, 1.0);
     
-    // 5. Film Grain (Organic texture using hash33)
-    let grain = (hash33(vec3<f32>(in.uv * tex_size, 0.0)) - 0.5) * 0.01;
+    // 5. Film Grain (Organic texture using hash33) -- seeded from the global
+    // pixel position (global_uv * full image size) rather than the tile's
+    // own tex_size, so grain doesn't visibly repeat per-tile either.
+    let full_image_size = tex_size / global_info.global_scale;
+    let grain = (hash33(vec3<f32>(global_uv * full_image_size, 0.0)) - 0.5) * 0.01;
 
-    let final_color = (combined * vignette) + grain;
+    let final_color = combined + grain;
     return vec4<f32>(final_color, 1.0);
 }

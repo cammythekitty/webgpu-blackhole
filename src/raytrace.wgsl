@@ -4,8 +4,13 @@ struct Uniforms {
     cam_pos: vec4<f32>,
     time: f32,
     _pad0: f32,
-    _pad1: f32,
-    _pad2: f32,
+    // Tile offset/scale for tiled super-resolution rendering.
+    // Maps the fullscreen NDC triangle's uv in [-1,1] into a sub-rectangle
+    // of the full frame: uv' = uv * tile_scale + tile_offset.
+    // Defaults to offset=(0,0), scale=(1,1) for normal full-frame rendering.
+    tile_offset: vec2<f32>,
+    tile_scale: vec2<f32>,
+    _pad_tail: vec4<f32>, // keep struct size a multiple of 16 bytes, matches Rust side
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -24,7 +29,10 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VOut {
     );
     var out: VOut;
     out.position = vec4<f32>(pos[vi], 0.0, 1.0);
-    out.uv = pos[vi];
+    // Window the full-screen triangle's uv down to the current tile's
+    // sub-rectangle of NDC space. For non-tiled rendering, tile_scale=(1,1)
+    // and tile_offset=(0,0) leave this a no-op.
+    out.uv = pos[vi] * u.tile_scale + u.tile_offset;
     return out;
 }
 
