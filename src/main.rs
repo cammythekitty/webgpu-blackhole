@@ -20,9 +20,6 @@ struct RaytraceUniforms {
     _pad0: f32,
     tile_offset: [f32; 2],
     tile_scale: [f32; 2],
-    // WGSL inserts an 8-byte alignment gap here because _pad_tail (vec4,
-    // align 16) can't start at byte 168 -- it gets pushed to 176. Mirror
-    // that gap explicitly so Rust's #[repr(C)] layout matches byte-for-byte.
     _pad_gap: [f32; 2],
     _pad_tail: [f32; 4],
 }
@@ -41,18 +38,12 @@ fn create_hdr_texture(device: &wgpu::Device, width: u32, height: u32, label: &st
     device.create_texture(&desc)
 }
 
-/// Renders one tile of the final image at `tile_w`x`tile_h` resolution (well
-/// under the GPU's max 2D texture dimension, e.g. <= 8192) and reads it back
-/// into a CPU-side RGBA8 buffer. `tile_offset`/`tile_scale` window the ray
-/// directions into the sub-rectangle of NDC space this tile covers, so
-/// adjacent tiles line up pixel-perfectly with no visible seams (same camera,
-/// same math, just a different slice of the frustum per tile).
 async fn render_tile(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     raytrace_pipeline: &wgpu::RenderPipeline,
-    h_blur_pipeline: &wgpu::RenderPipeline,
-    v_blur_pipeline: &wgpu::RenderPipeline,
+    kawase_down_pipeline: &wgpu::RenderPipeline,
+    kawase_up_pipeline: &wgpu::RenderPipeline,
     composite_pipeline: &wgpu::RenderPipeline,
     post_bgl: &wgpu::BindGroupLayout,
     composite_bgl: &wgpu::BindGroupLayout,
@@ -61,11 +52,6 @@ async fn render_tile(
     tile_w: u32,
     tile_h: u32,
     ray_u: RaytraceUniforms,
-    // (global_offset_x, global_offset_y, global_scale_x, global_scale_y):
-    // where this tile sits within the full stitched image, in [0,1] uv
-    // space, so screen-space-global effects (vignette, film grain) in the
-    // composite shader are computed relative to the whole image instead of
-    // each tile independently. [0,0,1,1] for a non-tiled full-frame render.
     composite_global_info: [f32; 4],
 ) -> Result<Vec<u8>, String> {
     let scene_tex = create_hdr_texture(device, tile_w, tile_h, "Tile Scene Texture");
@@ -101,8 +87,8 @@ async fn render_tile(
         entries: &[wgpu::BindGroupEntry { binding: 0, resource: ray_uniform_buffer.as_entire_binding() }],
     });
 
-    let h_blur_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("Tile H Blur BG"),
+    let kawase_down_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("Tile Kawase Down BG"),
         layout: post_bgl,
         entries: &[
             wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&scene_view) },
@@ -110,8 +96,8 @@ async fn render_tile(
         ],
     });
 
-    let v_blur_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("Tile V Blur BG"),
+    let kawase_up_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("Tile Kawase Up BG"),
         layout: post_bgl,
         entries: &[
             wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&bloom_view_1) },
@@ -157,7 +143,7 @@ async fn render_tile(
 
     {
         let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("Tile H Blur Pass"),
+            label: Some("Tile Kawase Down Pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: &bloom_view_1,
                 resolve_target: None,
@@ -167,14 +153,14 @@ async fn render_tile(
             timestamp_writes: None,
             occlusion_query_set: None,
         });
-        rpass.set_pipeline(h_blur_pipeline);
-        rpass.set_bind_group(0, &h_blur_bg, &[]);
+        rpass.set_pipeline(kawase_down_pipeline);
+        rpass.set_bind_group(0, &kawase_down_bg, &[]);
         rpass.draw(0..3, 0..1);
     }
 
     {
         let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("Tile V Blur Pass"),
+            label: Some("Tile Kawase Up Pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: &bloom_view_2,
                 resolve_target: None,
@@ -184,8 +170,8 @@ async fn render_tile(
             timestamp_writes: None,
             occlusion_query_set: None,
         });
-        rpass.set_pipeline(v_blur_pipeline);
-        rpass.set_bind_group(0, &v_blur_bg, &[]);
+        rpass.set_pipeline(kawase_up_pipeline);
+        rpass.set_bind_group(0, &kawase_up_bg, &[]);
         rpass.draw(0..3, 0..1);
     }
 
@@ -259,11 +245,6 @@ async fn render_tile(
     drop(data);
     staging_buffer.unmap();
 
-    // Explicitly drop all tile-local GPU resources and force a poll so
-    // wgpu actually reclaims their VRAM before the next tile starts
-    // allocating. Without this, resource destruction can be deferred until
-    // some later poll, and repeated per-tile allocation can pile up VRAM
-    // pressure across many tiles until an allocation stalls.
     drop(scene_view);
     drop(scene_tex);
     drop(bloom_view_1);
@@ -280,20 +261,12 @@ async fn render_tile(
     Ok(pixels)
 }
 
-/// Renders a `width`x`height` image by stitching together tiles no larger
-/// than `max_tile_dim` on a side (kept comfortably under the GPU's
-/// max_texture_dimension_2d, since consumer cards generally cap out around
-/// 8K-ish 2D texture support). Each tile is rendered fully offscreen in VRAM
-/// (small, tile-sized), read back to a small CPU staging buffer, then copied
-/// into its place in one big RAM-resident image buffer. The full final image
-/// therefore lives only in RAM, never in VRAM -- so e.g. a 128K shot's ~34GB
-/// RGBA8 buffer is bounded by system RAM, not GPU memory.
 async fn take_tiled_screenshot(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     raytrace_pipeline: &wgpu::RenderPipeline,
-    h_blur_pipeline: &wgpu::RenderPipeline,
-    v_blur_pipeline: &wgpu::RenderPipeline,
+    kawase_down_pipeline: &wgpu::RenderPipeline,
+    kawase_up_pipeline: &wgpu::RenderPipeline,
     composite_pipeline: &wgpu::RenderPipeline,
     ray_bgl: &wgpu::BindGroupLayout,
     post_bgl: &wgpu::BindGroupLayout,
@@ -309,10 +282,6 @@ async fn take_tiled_screenshot(
     out_path: &str,
 ) -> Result<(), String> {
     let aspect = width as f32 / height as f32;
-
-    // Pick a tile size that divides the image into a whole number of tiles
-    // and stays under max_tile_dim (and under the device's actual texture
-    // limit, as a safety net in case max_tile_dim was set too high).
     let device_limit = device.limits().max_texture_dimension_2d;
     let safe_tile_dim = max_tile_dim.min(device_limit);
 
@@ -320,9 +289,6 @@ async fn take_tiled_screenshot(
     let tiles_y = (height + safe_tile_dim - 1) / safe_tile_dim;
     let tile_w = (width + tiles_x - 1) / tiles_x;
     let tile_h = (height + tiles_y - 1) / tiles_y;
-    // Round tile dims up to a multiple of 4 to keep things friendly with
-    // texture/bytes-per-row alignment; edge tiles get clipped to the exact
-    // remainder so the final image is still exactly width x height.
     let tile_w = ((tile_w + 3) & !3).min(safe_tile_dim);
     let tile_h = ((tile_h + 3) & !3).min(safe_tile_dim);
 
@@ -332,13 +298,6 @@ async fn take_tiled_screenshot(
     );
 
     let approx_ram_bytes = (width as u64) * (height as u64) * 4;
-    println!(
-        "Final image will occupy ~{:.2} GB of RAM before encoding.",
-        approx_ram_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
-    );
-
-    // Full image buffer lives in RAM only. Never touches VRAM as a whole --
-    // only individual tiles are ever resident on the GPU.
     let mut full_pixels: Vec<u8> = vec![0u8; approx_ram_bytes as usize];
     let full_stride = (width * 4) as usize;
 
@@ -349,24 +308,13 @@ async fn take_tiled_screenshot(
             let this_tile_w = tile_w.min(width - x0);
             let this_tile_h = tile_h.min(height - y0);
 
-            // Render at the full tile_w/tile_h (so uv windowing math is
-            // consistent across tiles), then only copy the valid
-            // this_tile_w/this_tile_h region for edge tiles that would
-            // otherwise overshoot the image bounds.
             let tile_index = ty * tiles_x + tx + 1;
             let tile_start = Instant::now();
-            println!(
-                "  Tile {}/{}: rendering region ({}, {}) size {}x{}...",
-                tile_index, tiles_x * tiles_y, x0, y0, this_tile_w, this_tile_h
-            );
 
-            // Map this tile's pixel rect to a sub-rectangle of NDC [-1,1].
-            // NDC x in [-1,1] maps to pixel x in [0,width]; y is flipped
-            // (NDC +1 = top of screen = pixel row 0).
             let scale_x = tile_w as f32 / width as f32;
             let scale_y = tile_h as f32 / height as f32;
             let ndc_x0 = (x0 as f32 / width as f32) * 2.0 - 1.0;
-            let ndc_y1 = 1.0 - (y0 as f32 / height as f32) * 2.0; // top edge, NDC y (flipped)
+            let ndc_y1 = 1.0 - (y0 as f32 / height as f32) * 2.0;
             let offset_x = ndc_x0 + scale_x;
             let offset_y = ndc_y1 - scale_y;
 
@@ -380,11 +328,6 @@ async fn take_tiled_screenshot(
                 [scale_x, scale_y],
             );
 
-            // Composite-pass global info uses plain [0,1] uv space (matching
-            // bloom.wgsl's own vertex shader, which already outputs uv in
-            // [0,1] with y pre-flipped) -- so this is just the tile's
-            // top-left corner and size as a fraction of the full image,
-            // no NDC conversion needed (unlike the raytrace uniforms above).
             let composite_global_info = [
                 x0 as f32 / width as f32,
                 y0 as f32 / height as f32,
@@ -399,8 +342,8 @@ async fn take_tiled_screenshot(
                 device,
                 queue,
                 raytrace_pipeline,
-                h_blur_pipeline,
-                v_blur_pipeline,
+                kawase_down_pipeline,
+                kawase_up_pipeline,
                 composite_pipeline,
                 post_bgl,
                 composite_bgl,
@@ -413,15 +356,12 @@ async fn take_tiled_screenshot(
             )
             .await?;
 
-            // Pop the error scopes (validation first, since it was pushed
-            // last) and surface anything the GPU driver flagged instead of
-            // letting the process silently hang or continue in a bad state.
             if let Some(err) = pollster::block_on(device.pop_error_scope()) {
                 return Err(format!("GPU validation error on tile {}/{}: {}", tile_index, tiles_x * tiles_y, err));
             }
             if let Some(err) = pollster::block_on(device.pop_error_scope()) {
                 return Err(format!(
-                    "GPU ran out of memory rendering tile {}/{} ({}x{} tile) -- try a smaller max_tile_dim: {}",
+                    "GPU ran out of memory rendering tile {}/{} ({}x{} tile): {}",
                     tile_index, tiles_x * tiles_y, tile_w, tile_h, err
                 ));
             }
@@ -431,7 +371,6 @@ async fn take_tiled_screenshot(
                 tile_index, tiles_x * tiles_y, tile_start.elapsed().as_secs_f32()
             );
 
-            // Blit this tile's valid region into the full image buffer.
             let copy_bytes = (this_tile_w * 4) as usize;
             for row in 0..this_tile_h {
                 let src_start = (row * tile_w) as usize * 4;
@@ -443,7 +382,7 @@ async fn take_tiled_screenshot(
         }
     }
 
-    println!("Encoding final {}x{} PNG to {}... (this may take a while for very large images)", width, height, out_path);
+    println!("Encoding final {}x{} PNG to {}...", width, height, out_path);
     let img: ImageBuffer<Rgba<u8>, _> = ImageBuffer::from_raw(width, height, full_pixels)
         .ok_or("Failed to create image buffer from stitched pixels")?;
 
@@ -508,9 +447,6 @@ fn main() {
     let mut pitch: f32 = 0.20;
     let mut is_dragging = false;
     let mut last_mouse_pos: Option<(f64, f64)> = None;
-    // While true, live preview redraws are paused so the GPU's full attention
-    // goes to the (potentially many, potentially huge) tile renders for a
-    // screenshot capture instead of competing with the 60fps preview loop.
     let mut capturing = false;
 
     let start_time = Instant::now();
@@ -602,13 +538,9 @@ fn main() {
     let mut bloom_view_1 = bloom_tex_1.create_view(&Default::default());
     let mut bloom_view_2 = bloom_tex_2.create_view(&Default::default());
 
-    let mut h_blur_bg = make_post_bg(&device, &post_bgl, &scene_view, &sampler);
-    let mut v_blur_bg = make_post_bg(&device, &post_bgl, &bloom_view_1, &sampler);
+    let mut kawase_down_bg = make_post_bg(&device, &post_bgl, &scene_view, &sampler);
+    let mut kawase_up_bg = make_post_bg(&device, &post_bgl, &bloom_view_1, &sampler);
 
-    // Default composite global-info uniform for normal (non-tiled) live
-    // rendering: offset (0,0), scale (1,1), i.e. "this tile IS the whole
-    // image." Only the tiled screenshot path (render_tile) uses non-default
-    // values, computed per-tile.
     let composite_global_default: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
     let composite_global_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("Composite Global Info Buffer"),
@@ -651,42 +583,32 @@ fn main() {
     let comp_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[&composite_bgl], push_constant_ranges: &[] });
 
     let raytrace_pipeline = make_pipeline(&device, &ray_pipeline_layout, &raytrace_shader, "vs_main", "fs_main", wgpu::TextureFormat::Rgba16Float);
-    let h_blur_pipeline = make_pipeline(&device, &post_pipeline_layout, &bloom_shader, "vs_main", "fs_horizontal_blur", wgpu::TextureFormat::Rgba16Float);
-    let v_blur_pipeline = make_pipeline(&device, &post_pipeline_layout, &bloom_shader, "vs_main", "fs_vertical_blur", wgpu::TextureFormat::Rgba16Float);
+    let kawase_down_pipeline = make_pipeline(&device, &post_pipeline_layout, &bloom_shader, "vs_main", "fs_kawase_down", wgpu::TextureFormat::Rgba16Float);
+    let kawase_up_pipeline = make_pipeline(&device, &post_pipeline_layout, &bloom_shader, "vs_main", "fs_kawase_up", wgpu::TextureFormat::Rgba16Float);
     let composite_pipeline = make_pipeline(&device, &comp_pipeline_layout, &bloom_shader, "vs_main", "fs_composite", config.format);
 
-    // Arc-wrapped handles so a capture can be rendered on its own worker
-    // thread without blocking the winit/GUI thread. wgpu's Device/Queue and
-    // pipeline/layout objects are Send + Sync, so sharing them across threads
-    // for concurrent submission is sound; wgpu serializes actual GPU command
-    // submission internally.
     let device_arc = Arc::new(device);
     let queue_arc = Arc::new(queue);
     let raytrace_pipeline_arc = Arc::new(raytrace_pipeline);
-    let h_blur_pipeline_arc = Arc::new(h_blur_pipeline);
-    let v_blur_pipeline_arc = Arc::new(v_blur_pipeline);
+    let kawase_down_pipeline_arc = Arc::new(kawase_down_pipeline);
+    let kawase_up_pipeline_arc = Arc::new(kawase_up_pipeline);
     let composite_pipeline_arc = Arc::new(composite_pipeline);
-    let ray_bgl_arc = Arc::new(ray_bgl);
+    let _ray_bgl_arc = Arc::new(ray_bgl);
     let post_bgl_arc = Arc::new(post_bgl);
     let composite_bgl_arc = Arc::new(composite_bgl);
     let sampler_arc = Arc::new(sampler);
 
-    // Shadow the original bindings with the Arc-wrapped versions so all the
-    // existing `&device`, `&raytrace_pipeline`, etc. call sites below keep
-    // working unchanged (Arc<T> derefs to &T).
     let device = device_arc.clone();
     let queue = queue_arc.clone();
     let raytrace_pipeline = raytrace_pipeline_arc.clone();
-    let h_blur_pipeline = h_blur_pipeline_arc.clone();
-    let v_blur_pipeline = v_blur_pipeline_arc.clone();
+    let kawase_down_pipeline = kawase_down_pipeline_arc.clone();
+    let kawase_up_pipeline = kawase_up_pipeline_arc.clone();
     let composite_pipeline = composite_pipeline_arc.clone();
-    let ray_bgl = ray_bgl_arc.clone();
+    let ray_bgl = _ray_bgl_arc.clone();
     let post_bgl = post_bgl_arc.clone();
     let composite_bgl = composite_bgl_arc.clone();
     let sampler = sampler_arc.clone();
 
-    // Channel the capture worker thread uses to report completion back to
-    // the GUI thread without either side blocking on the other.
     let (capture_tx, capture_rx) = std::sync::mpsc::channel::<(Result<(), String>, String)>();
 
     let target_frame_time = std::time::Duration::from_secs_f32(1.0 / 60.0);
@@ -709,8 +631,8 @@ fn main() {
             bloom_view_1 = bloom_tex_1.create_view(&Default::default());
             bloom_view_2 = bloom_tex_2.create_view(&Default::default());
 
-            h_blur_bg = make_post_bg(&device, &post_bgl, &scene_view, &sampler);
-            v_blur_bg = make_post_bg(&device, &post_bgl, &bloom_view_1, &sampler);
+            kawase_down_bg = make_post_bg(&device, &post_bgl, &scene_view, &sampler);
+            kawase_up_bg = make_post_bg(&device, &post_bgl, &bloom_view_1, &sampler);
             composite_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("Composite BG"),
                 layout: &composite_bgl,
@@ -724,16 +646,7 @@ fn main() {
         }
         Event::WindowEvent { event: WindowEvent::KeyboardInput { event: key_event, .. }, .. } => {
             if key_event.state == ElementState::Pressed {
-                // P = 8K single-shot (no tiling needed, fits under GPU texture limits).
-                // O = 16K tiled capture. I = 128K tiled capture (huge; RAM-bound, see warning).
                 let capture: Option<(u32, u32, u32, &str)> = match key_event.physical_key {
-                    // max_tile_dim kept well under the ~8K-ish practical
-                    // ceiling on consumer GPUs (rather than right at it) so
-                    // there's VRAM headroom left for the bloom/output/staging
-                    // textures that get allocated alongside the main tile,
-                    // and so repeated per-tile allocation across many tiles
-                    // (128K = 144 of them) doesn't creep up against the
-                    // limit and stall the driver.
                     PhysicalKey::Code(KeyCode::KeyP) => Some((7680, 4320, 4096, "black_hole_8k.png")),
                     PhysicalKey::Code(KeyCode::KeyO) => Some((15360, 8640, 4096, "black_hole_16k.png")),
                     PhysicalKey::Code(KeyCode::KeyI) => Some((122880, 69120, 4096, "black_hole_128k.png")),
@@ -745,31 +658,15 @@ fn main() {
                         println!(">>> A capture is already in progress, ignoring key press.");
                     } else {
                         let current_time = start_time.elapsed().as_secs_f32();
-
-                        // Pause the live preview loop so the GPU isn't splitting
-                        // time between 60fps preview frames and capture tiles.
                         capturing = true;
 
-                        if w > 8192 || h > 8192 {
-                            let approx_gb = (w as u64 * h as u64 * 4) as f64 / (1024.0 * 1024.0 * 1024.0);
-                            println!(
-                                ">>> Triggering {}x{} tiled capture -- this needs ~{:.1} GB of RAM for the final image, plus time to render and stitch every tile. Live preview paused. Rendering on a background thread so the window stays responsive...",
-                                w, h, approx_gb
-                            );
-                        } else {
-                            println!(">>> Triggering {}x{} screenshot capture on a background thread...", w, h);
-                        }
-
-                        // Clone Arc handles (cheap refcount bumps) to move
-                        // into the worker thread. The GUI/winit thread keeps
-                        // its own clones and is never blocked by the capture.
                         let device = device_arc.clone();
                         let queue = queue_arc.clone();
                         let raytrace_pipeline = raytrace_pipeline_arc.clone();
-                        let h_blur_pipeline = h_blur_pipeline_arc.clone();
-                        let v_blur_pipeline = v_blur_pipeline_arc.clone();
+                        let kawase_down_pipeline = kawase_down_pipeline_arc.clone();
+                        let kawase_up_pipeline = kawase_up_pipeline_arc.clone();
                         let composite_pipeline = composite_pipeline_arc.clone();
-                        let ray_bgl = ray_bgl_arc.clone();
+                        let ray_bgl = _ray_bgl_arc.clone();
                         let post_bgl = post_bgl_arc.clone();
                         let composite_bgl = composite_bgl_arc.clone();
                         let sampler = sampler_arc.clone();
@@ -781,8 +678,8 @@ fn main() {
                                 &device,
                                 &queue,
                                 &raytrace_pipeline,
-                                &h_blur_pipeline,
-                                &v_blur_pipeline,
+                                &kawase_down_pipeline,
+                                &kawase_up_pipeline,
                                 &composite_pipeline,
                                 &ray_bgl,
                                 &post_bgl,
@@ -797,8 +694,6 @@ fn main() {
                                 max_tile,
                                 &out_path_owned,
                             ));
-                            // Ignore send errors: if the GUI thread is gone,
-                            // there's nothing left to report to.
                             let _ = tx.send((res, out_path_owned));
                         });
                     }
@@ -823,11 +718,6 @@ fn main() {
             camera_distance = (if scroll > 0.0 { camera_distance * 0.9 } else { camera_distance * 1.1 }).clamp(3.0, 80.0);
         }
         Event::AboutToWait => {
-            // Non-blocking check: has the background capture thread finished?
-            // try_recv never blocks, so the GUI event loop keeps pumping
-            // window events (moves, resizes, close requests) the entire time
-            // a capture is rendering, instead of freezing and risking the
-            // OS/driver flagging the window as unresponsive.
             if let Ok((res, out_path)) = capture_rx.try_recv() {
                 match res {
                     Ok(()) => println!(">>> Screenshot saved successfully to {}!", out_path),
@@ -875,7 +765,7 @@ fn main() {
 
             {
                 let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("Horizontal Blur"),
+                    label: Some("Kawase Down Pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: &bloom_view_1,
                         resolve_target: None,
@@ -885,14 +775,14 @@ fn main() {
                     timestamp_writes: None,
                     occlusion_query_set: None,
                 });
-                rpass.set_pipeline(&h_blur_pipeline);
-                rpass.set_bind_group(0, &h_blur_bg, &[]);
+                rpass.set_pipeline(&kawase_down_pipeline);
+                rpass.set_bind_group(0, &kawase_down_bg, &[]);
                 rpass.draw(0..3, 0..1);
             }
 
             {
                 let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("Vertical Blur"),
+                    label: Some("Kawase Up Pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: &bloom_view_2,
                         resolve_target: None,
@@ -902,8 +792,8 @@ fn main() {
                     timestamp_writes: None,
                     occlusion_query_set: None,
                 });
-                rpass.set_pipeline(&v_blur_pipeline);
-                rpass.set_bind_group(0, &v_blur_bg, &[]);
+                rpass.set_pipeline(&kawase_up_pipeline);
+                rpass.set_bind_group(0, &kawase_up_bg, &[]);
                 rpass.draw(0..3, 0..1);
             }
 
