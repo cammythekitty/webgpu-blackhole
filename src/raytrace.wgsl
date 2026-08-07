@@ -104,8 +104,8 @@ fn ridged_fbm(p: vec3<f32>) -> f32 {
     var pos = p;
     for (var i = 0; i < 4; i++) {
         let n = noise3d(pos);
-        let ridge = 1.0 - abs(n * 2.0 - 1.0); // Sharp ridges instead of smooth waves
-        val += ridge * ridge * amp;            // Square it for extra contrast
+        let ridge = 1.0 - abs(n * 2.0 - 1.0);
+        val += ridge * ridge * amp;
         pos *= 2.1;
         amp *= 0.5;
     }
@@ -131,7 +131,7 @@ fn sample_accretion_disk(pos: vec3<f32>, vel: vec3<f32>) -> vec4<f32> {
 
     let r = length(pitched_pos.xz);
     let r_isco = 2.6;
-    let r_outer = 15.0;
+    let r_outer = 24.0; // Extended bounds to allow gas stream to drift outward smoothly
 
     if (r < r_isco || r > r_outer) {
         return vec4<f32>(0.0);
@@ -139,46 +139,41 @@ fn sample_accretion_disk(pos: vec3<f32>, vel: vec3<f32>) -> vec4<f32> {
 
     let dilated_time = u.time * sqrt(max(0.1, 1.0 - 1.0 / r));
 
+    let spin = 0.45;
     let phi = atan2(pitched_pos.z, pitched_pos.x);
-    let shear = 3.5 / (r * sqrt(r));
-    let twisted_phi = phi - shear * dilated_time;
+    let frame_drag = spin / (r * r * r + spin * spin);
+    let shear = (3.5 + frame_drag * 2.5) / (r * sqrt(r));
+    let twisted_phi = phi - shear * dilated_time + frame_drag * 1.8;
 
     let warp_p = vec3<f32>(r * cos(twisted_phi), pitched_pos.y * 6.0, r * sin(twisted_phi));
     
-    // -------------------------------------------------------------
-    // 1. RIDGED FILAMENTS & MICRO-CLUMPS
-    // -------------------------------------------------------------
     let macro_clumps = ridged_fbm(warp_p * 1.2);
     let micro_strands = ridged_fbm(warp_p * 4.5 + vec3<f32>(dilated_time * 0.5));
     
     var clumpy_texture = macro_clumps * 0.6 + micro_strands * 0.4;
-    
-    // Hard cutoff: zero out weak density so there is empty space between bumps
     clumpy_texture = smoothstep(0.2, 0.85, clumpy_texture);
 
-    // -------------------------------------------------------------
-    // 2. BUMPY DISK THICKNESS (Displaces height vertically)
-    // -------------------------------------------------------------
     let height_bump = noise3d(warp_p * 2.5 + vec3<f32>(0.0, dilated_time, 0.0)) * 0.6;
     let disk_scale = (0.015 + 0.010 * (r - r_isco)) * (0.6 + height_bump);
     
-    // Evaluate height profile with perturbed vertical coordinate
     let y_offset = pitched_pos.y + (noise3d(warp_p * 3.0) - 0.5) * 0.03;
     let height = exp(-(y_offset * y_offset) / (disk_scale * disk_scale));
 
-    if (height < 0.001) { return vec4<f32>(0.0); }
-
-    let base_radial = smoothstep(r_isco, r_isco + 0.3, r) * (1.0 - smoothstep(r_outer - 1.0, r_outer, r));
-    
-    // Combine into sharp, non-linear density
+    // Smooth inner/outer transition masks to eliminate blocky artifacts
+    let base_radial = smoothstep(r_isco, r_isco + 0.4, r) * (1.0 - smoothstep(14.0, 22.0, r));
     let raw_density = base_radial * clumpy_texture * height;
-    if (raw_density < 0.002) { return vec4<f32>(0.0); }
-    
-    let uneven_density = pow(raw_density, 1.3);
+    let uneven_density = pow(max(0.0, raw_density), 1.3);
 
-    // -------------------------------------------------------------
-    // RELATIVISTIC DOPPLER & BLACKBODY COLORING
-    // -------------------------------------------------------------
+    // Smoothly fading corona gas stretching past the main disk edge
+    let corona_radial = smoothstep(r_isco, r_isco + 0.5, r) * (1.0 - smoothstep(15.0, 24.0, r));
+    let corona_scale = disk_scale * 5.0;
+    let corona_height = exp(-(y_offset * y_offset) / (corona_scale * corona_scale));
+    let corona_noise = fbm(warp_p * 0.5 + vec3<f32>(dilated_time * 0.1)); // Lower frequency noise for smooth gas
+    let corona_density = corona_radial * corona_height * corona_noise * 0.10;
+
+    let total_density = uneven_density + corona_density;
+    if (total_density < 0.0005) { return vec4<f32>(0.0); }
+
     let v_orbital = sqrt(0.5 / r);
     let disk_vel = vec3<f32>(-sin(phi), 0.0, cos(phi)) * v_orbital;
     
@@ -197,7 +192,10 @@ fn sample_accretion_disk(pos: vec3<f32>, vel: vec3<f32>) -> vec4<f32> {
     var color = blackbody(effective_temp);
     color *= beaming_factor * grav_shift * 3.8;
 
-    return vec4<f32>(color * uneven_density, uneven_density * 0.45);
+    let corona_color = mix(color * 0.4, vec3<f32>(0.6, 0.8, 1.0), 0.5);
+    let final_color = mix(color, corona_color, corona_density / (total_density + 0.0001));
+
+    return vec4<f32>(final_color * total_density, total_density * 0.45);
 }
 
 fn planet_noise(p: vec3<f32>) -> f32 {
@@ -211,7 +209,7 @@ fn planet_noise(p: vec3<f32>) -> f32 {
     let n110 = hash33(i + vec3<f32>(1.0, 1.0, 0.0));
     let n001 = hash33(i + vec3<f32>(0.0, 0.0, 1.0));
     let n101 = hash33(i + vec3<f32>(1.0, 0.0, 1.0));
-    let n011 = hash33(i + vec3<f32>(0.0, 1.0, 1.0));
+    let n011 = hash33(i + vec3<f32>(1.0, 1.0, 1.1));
     let n111 = hash33(i + vec3<f32>(1.0, 1.0, 1.0));
 
     return mix(
@@ -281,7 +279,6 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
     var dir = normalize((inv_view * vec4<f32>(ray_dir_view, 0.0)).xyz);
     var pos = u.cam_pos.xyz;
 
-    // Ray dithering to prevent step banding
     let jitter = hash33(vec3<f32>(in.uv * 1000.0, u.time));
     pos += dir * (jitter * 0.005);
 
@@ -290,9 +287,7 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
     var transmittance = 1.0;
     var min_r = 1000.0;
 
-    // Tracks total light energy accumulated from the accretion disk
     var disk_light_accum = vec3<f32>(0.0);
-    // Tracks proximity to the bright inner disk edge (near ISCO)
     var inner_disk_proximity = 0.0;
 
     for (var step = 0; step < 500; step++) {
@@ -301,12 +296,10 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
         
         min_r = min(min_r, r);
 
-        // 1. Captured by Event Horizon -> Pure Pitch Black (No Glow)
         if (r <= rs * 1.01) {
             return vec4<f32>(tonemap(color, 1.6), 1.0);
         }
 
-        // 2. Escape to Deep Space
         if (r > 100.0) {
             let planet_sample = sample_background_planet(pos, dir);
             
@@ -314,67 +307,79 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
                 let gravitational_redshift = sqrt(max(0.05, 1.0 - rs / min_r));
                 color += planet_sample.rgb * gravitational_redshift * transmittance;
             } else {
-                let star_scale = 160.0;
-                let grid = dir * star_scale;
-                let cell_id = floor(grid);
-                let cell_uv = fract(grid) - vec3<f32>(0.5);
-
-                let h = hash33(cell_id);
-                var star_brightness = 0.0;
-
-                if (h > 0.993) {
-                    let dist = length(cell_uv);
-                    let star_shape = smoothstep(0.25, 0.0, dist); 
-                    let star_intensity = (h - 0.993) / 0.007; 
-                    star_brightness = star_shape * star_intensity * 1.5;
+                let scale1 = 1600.0;
+                let id1 = floor(dir * scale1);
+                let uv1 = fract(dir * scale1) - vec3<f32>(0.5);
+                let h1 = hash33(id1);
+                
+                var star_light = vec3<f32>(0.0);
+                
+                if (h1 > 0.995) {
+                    let dist1 = length(uv1);
+                    let intensity = pow((h1 - 0.995) / 0.005, 2.0) * 2.0;
+                    let star_color = mix(vec3<f32>(0.7, 0.8, 1.0), vec3<f32>(1.0, 0.9, 0.7), hash33(id1 + 1.0));
+                    star_light += star_color * smoothstep(0.3, 0.0, dist1) * intensity;
                 }
 
-                color += vec3<f32>(star_brightness) * transmittance;
+                let scale2 = 480.0;
+                let id2 = floor(dir * scale2 + 42.0);
+                let uv2 = fract(dir * scale2 + 42.0) - vec3<f32>(0.5);
+                let h2 = hash33(id2);
+
+                if (h2 > 0.985) {
+                    let dist2 = length(uv2);
+                    let intensity = pow((h2 - 0.985) / 0.015, 1.5) * 3.5;
+                    let star_color = mix(vec3<f32>(0.6, 0.8, 1.0), vec3<f32>(1.0, 0.95, 0.8), hash33(id2 + 50.0));
+                    let glow = exp(-dist2 * dist2 * 16.0);
+                    star_light += star_color * glow * intensity;
+                }
+
+                color += star_light * transmittance;
             }
             break;
         }
 
-        // Adaptive Step Sizing
+        // Adaptive Step Sizing (Clean & Smooth)
         let photon_sphere_r = 1.5 * rs;
         let dist_from_photon_sphere = abs(r - photon_sphere_r);
         let photon_sphere_tightening = smoothstep(1.2, 0.0, dist_from_photon_sphere);
-        let in_disk_zone = smoothstep(16.0, 14.0, r) * smoothstep(2.0, 2.6, r);
+        let in_disk_zone = smoothstep(24.0, 20.0, r) * smoothstep(2.0, 2.6, r);
 
         var h_step = clamp((r - rs) * 0.04, 0.003, 0.5);
         h_step = mix(h_step, h_step * 0.15, photon_sphere_tightening);
         h_step = mix(h_step, h_step * 0.35, in_disk_zone);
 
-        // 3. Volumetric Accretion Disk Sampling
         let disk = sample_accretion_disk(pos, dir);
-        if (disk.a > 0.0) {
-            let sample_color = disk.rgb * transmittance;
-            color += sample_color;
-            disk_light_accum += sample_color; // Store disk radiance for bloom
+        let density = disk.a;
 
-            transmittance *= (1.0 - disk.a);
+        if (density > 0.0) {
+            let opacity_scale = 8.0; 
+            let optical_depth = density * opacity_scale * h_step;
+            let step_transmittance = exp(-optical_depth);
+            let step_factor = 1.0 - step_transmittance;
+            
+            let sample_color = disk.rgb * transmittance * step_factor;
+            color += sample_color;
+            disk_light_accum += sample_color;
+
+            transmittance *= step_transmittance;
             if (transmittance < 0.005) { break; }
         }
 
-        // Measure how close the ray grazed to the scorching inner edge of the disk (r ~ 2.6 - 4.0)
         let dist_to_isco = abs(r - 3.0);
         inner_disk_proximity += exp(-dist_to_isco * 1.5) * h_step;
 
-        // 4. Geodesic Light Ray Bending
         let L = cross(pos, dir);
         let L2 = dot(L, L);
-        let accel = -1.5 * rs * L2 * pos / (r2 * r2 * r);
+        let base_accel = -1.5 * rs * L2 * pos / (r2 * r2 * r);
+        let dispersion_multiplier = 1.0 + (rs / r2) * 0.02;
+        let accel = base_accel * dispersion_multiplier;
 
         dir = normalize(dir + accel * h_step);
         pos += dir * h_step;
     }
 
-    // -------------------------------------------------------------
-    // ACCRETION DISK BLOOM & PHOTON RING BLEED
-    // -------------------------------------------------------------
-    // 1. Direct light halo: intense glowing pixels bleed outward proportionally
     let disk_bloom = disk_light_accum * 0.35;
-
-    // 2. Inner-edge thermal glare: subtle optical bleed from grazing the ISCO zone
     let isco_glare = vec3<f32>(1.0, 0.85, 0.5) * inner_disk_proximity * 0.08;
 
     color += disk_bloom + isco_glare;
