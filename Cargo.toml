@@ -1,0 +1,12 @@
+[package]
+name = "blackhole"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wgpu = "22.1"
+winit = "0.29"
+bytemuck = { version = "1.14", features = ["derive"] }
+image = "0.24"
+rand = "0.8"
+pollster = "0.3"
