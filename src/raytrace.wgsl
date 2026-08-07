@@ -166,7 +166,7 @@ fn sample_accretion_disk(pos: vec3<f32>, vel: vec3<f32>) -> vec4<f32> {
 
     // Smoothly fading corona gas stretching past the main disk edge
     let corona_radial = smoothstep(r_isco, r_isco + 0.5, r) * (1.0 - smoothstep(15.0, 24.0, r));
-    let corona_scale = disk_scale * 5.0;
+    let corona_scale = disk_scale * 4.0;
     let corona_height = exp(-(y_offset * y_offset) / (corona_scale * corona_scale));
     let corona_noise = fbm(warp_p * 0.5 + vec3<f32>(dilated_time * 0.1)); // Lower frequency noise for smooth gas
     let corona_density = corona_radial * corona_height * corona_noise * 0.10;
