@@ -117,7 +117,7 @@ fn fs_composite(in: VOut) -> @location(0) vec4<f32> {
         }
     }
 
-    let combined = scene + (bloom * 0.7) + ghost_sum + streak;
+    let combined = scene + (bloom * 0.7) + streak;
 
     // 4. Vignetting (Darker corners)
     let uv_dist = length(center_uv);
