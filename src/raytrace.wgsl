@@ -113,7 +113,7 @@ fn ridged_fbm(p: vec3<f32>) -> f32 {
 }
 
 fn sample_accretion_disk(pos: vec3<f32>, vel: vec3<f32>) -> vec4<f32> {
-    let pitch_angle = 0.28;
+    let pitch_angle = 0.4;
     let cos_p = cos(pitch_angle);
     let sin_p = sin(pitch_angle);
 
@@ -307,26 +307,26 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
                 let gravitational_redshift = sqrt(max(0.05, 1.0 - rs / min_r));
                 color += planet_sample.rgb * gravitational_redshift * transmittance;
             } else {
-                let scale1 = 1600.0;
+                let scale1 = 800.0;
                 let id1 = floor(dir * scale1);
                 let uv1 = fract(dir * scale1) - vec3<f32>(0.5);
                 let h1 = hash33(id1);
                 
                 var star_light = vec3<f32>(0.0);
                 
-                if (h1 > 0.995) {
+                if (h1 > 0.999) {
                     let dist1 = length(uv1);
                     let intensity = pow((h1 - 0.995) / 0.005, 2.0) * 2.0;
                     let star_color = mix(vec3<f32>(0.7, 0.8, 1.0), vec3<f32>(1.0, 0.9, 0.7), hash33(id1 + 1.0));
                     star_light += star_color * smoothstep(0.3, 0.0, dist1) * intensity;
                 }
 
-                let scale2 = 480.0;
+                let scale2 = 240.0;
                 let id2 = floor(dir * scale2 + 42.0);
                 let uv2 = fract(dir * scale2 + 42.0) - vec3<f32>(0.5);
                 let h2 = hash33(id2);
 
-                if (h2 > 0.985) {
+                if (h2 > 0.995) {
                     let dist2 = length(uv2);
                     let intensity = pow((h2 - 0.985) / 0.015, 1.5) * 3.5;
                     let star_color = mix(vec3<f32>(0.6, 0.8, 1.0), vec3<f32>(1.0, 0.95, 0.8), hash33(id2 + 50.0));
@@ -384,6 +384,13 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
 
     color += disk_bloom + isco_glare;
 
+    // --- Camera Bloom Extraction & Highlights ---
+    let luminance = dot(color, vec3<f32>(0.2126, 0.7152, 0.0722));
+    let bloom_threshold = 0.75;
+    let bloom_factor = smoothstep(bloom_threshold, bloom_threshold + 0.4, luminance);
+    let bright_highlights = color * bloom_factor * 1.5;
+
+    // Pack main color into RGB, and store the isolated bloom intensity in alpha
     let final_color = tonemap(color, 1.6);
-    return vec4<f32>(final_color, 1.0);
+    return vec4<f32>(final_color, max(max(bright_highlights.r, bright_highlights.g), bright_highlights.b));
 }

@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 use winit::{
@@ -20,13 +20,27 @@ struct RaytraceUniforms {
     _pad2: f32,
 }
 
+fn create_hdr_texture(device: &wgpu::Device, width: u32, height: u32, label: &str) -> wgpu::Texture {
+    let desc = wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba16Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    };
+    device.create_texture(&desc)
+}
+
 fn main() {
     let event_loop = EventLoop::new().unwrap();
     event_loop.set_control_flow(ControlFlow::Poll);
 
     let window = Arc::new(
         WindowBuilder::new()
-            .with_title("Curved Geodesic Black Hole Raytracer")
+            .with_title("Curved Geodesic Black Hole Raytracer with Bloom")
             .with_inner_size(winit::dpi::LogicalSize::new(1000.0, 1000.0))
             .build(&event_loop)
             .unwrap(),
@@ -56,7 +70,20 @@ fn main() {
     config.present_mode = wgpu::PresentMode::Fifo;
     surface.configure(&device, &config);
 
-    // Camera orbit parameters
+    let mut width = config.width.max(1);
+    let mut height = config.height.max(1);
+    let scene_tex = create_hdr_texture(&device, width, height, "Scene Texture");
+    let bloom_tex_1 = create_hdr_texture(&device, width / 2, height / 2, "Bloom Tex 1");
+    let bloom_tex_2 = create_hdr_texture(&device, width / 2, height / 2, "Bloom Tex 2");
+
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    });
+
     let mut camera_distance: f32 = 18.0;
     let mut yaw: f32 = 0.0;
     let mut pitch: f32 = 0.20;
@@ -64,182 +91,286 @@ fn main() {
     let mut last_mouse_pos: Option<(f64, f64)> = None;
 
     let start_time = Instant::now();
-
     let ray_uniforms = build_ray_uniforms(yaw, pitch, camera_distance, 1.0, 0.0);
-
     let ray_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("Raytrace Uniform Buffer"),
         contents: bytemuck::bytes_of(&ray_uniforms),
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     });
 
-    // Load WGSL Raytracing Shader
+    // Shaders & Pipelines setup
     let raytrace_shader = device.create_shader_module(wgpu::include_wgsl!("raytrace.wgsl"));
+    let bloom_shader = device.create_shader_module(wgpu::include_wgsl!("bloom.wgsl"));
 
-    // Pipeline Layout
-    let ray_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("Raytrace Layout"),
+    let ray_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("Ray Layout"),
         entries: &[wgpu::BindGroupLayoutEntry {
             binding: 0,
             visibility: wgpu::ShaderStages::FRAGMENT,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
+            ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
             count: None,
         }],
     });
-
-    let ray_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("Raytrace Bind Group"),
-        layout: &ray_bind_group_layout,
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: ray_uniform_buffer.as_entire_binding(),
-        }],
+    let ray_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("Ray BG"),
+        layout: &ray_bgl,
+        entries: &[wgpu::BindGroupEntry { binding: 0, resource: ray_uniform_buffer.as_entire_binding() }],
     });
 
-    let ray_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("Raytrace Pipeline Layout"),
-        bind_group_layouts: &[&ray_bind_group_layout],
-        push_constant_ranges: &[],
+    let post_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("Post Layout"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry { 
+                binding: 0, 
+                visibility: wgpu::ShaderStages::FRAGMENT, 
+                ty: wgpu::BindingType::Texture { 
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true }, 
+                    view_dimension: wgpu::TextureViewDimension::D2, 
+                    multisampled: false 
+                }, 
+                count: None 
+            },
+            wgpu::BindGroupLayoutEntry { 
+                binding: 1, 
+                visibility: wgpu::ShaderStages::FRAGMENT, 
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), 
+                count: None 
+            },
+        ],
     });
 
-    let raytrace_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("Raytrace Pipeline"),
-        layout: Some(&ray_pipeline_layout),
-        vertex: wgpu::VertexState {
-            module: &raytrace_shader,
-            entry_point: "vs_main",
-            buffers: &[],
-            compilation_options: Default::default(),
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: &raytrace_shader,
-            entry_point: "fs_main",
-            targets: &[Some(wgpu::ColorTargetState {
-                format: config.format,
-                blend: Some(wgpu::BlendState::REPLACE),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-            compilation_options: Default::default(),
-        }),
-        primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::TriangleList,
-            ..Default::default()
-        },
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState::default(),
-        multiview: None,
-        cache: None,
+    let composite_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("Composite Layout"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry { 
+                binding: 2, 
+                visibility: wgpu::ShaderStages::FRAGMENT, 
+                ty: wgpu::BindingType::Texture { 
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true }, 
+                    view_dimension: wgpu::TextureViewDimension::D2, 
+                    multisampled: false 
+                }, 
+                count: None 
+            },
+            wgpu::BindGroupLayoutEntry { 
+                binding: 3, 
+                visibility: wgpu::ShaderStages::FRAGMENT, 
+                ty: wgpu::BindingType::Texture { 
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true }, 
+                    view_dimension: wgpu::TextureViewDimension::D2, 
+                    multisampled: false 
+                }, 
+                count: None 
+            },
+            wgpu::BindGroupLayoutEntry { 
+                binding: 4, 
+                visibility: wgpu::ShaderStages::FRAGMENT, 
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), 
+                count: None 
+            },
+        ],
     });
 
-    let target_frame_time = Duration::from_secs_f32(1.0 / 60.0);
+    // Helper function to create bind groups
+    let make_post_bg = |dev: &wgpu::Device, layout: &wgpu::BindGroupLayout, tex_view: &wgpu::TextureView, samp: &wgpu::Sampler| {
+        dev.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Post BG"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(tex_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(samp) },
+            ],
+        })
+    };
+
+    let mut scene_view = scene_tex.create_view(&Default::default());
+    let mut bloom_view_1 = bloom_tex_1.create_view(&Default::default());
+    let mut bloom_view_2 = bloom_tex_2.create_view(&Default::default());
+
+    let mut h_blur_bg = make_post_bg(&device, &post_bgl, &scene_view, &sampler);
+    let mut v_blur_bg = make_post_bg(&device, &post_bgl, &bloom_view_1, &sampler);
+    
+    let mut composite_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("Composite BG"),
+        layout: &composite_bgl,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&scene_view) },
+            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&bloom_view_2) },
+            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&sampler) },
+        ],
+    });
+
+    let make_pipeline = |dev: &wgpu::Device, layout: &wgpu::PipelineLayout, shader: &wgpu::ShaderModule, entry: &str, format: wgpu::TextureFormat| {
+        dev.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(entry),
+            layout: Some(layout),
+            vertex: wgpu::VertexState { module: shader, entry_point: "vs_main", buffers: &[], compilation_options: Default::default() },
+            fragment: Some(wgpu::FragmentState {
+                module: shader,
+                entry_point: entry,
+                targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, ..Default::default() },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        })
+    };
+
+    let ray_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[&ray_bgl], push_constant_ranges: &[] });
+    let post_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[&post_bgl], push_constant_ranges: &[] });
+    let comp_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[&composite_bgl], push_constant_ranges: &[] });
+
+    let raytrace_pipeline = make_pipeline(&device, &ray_pipeline_layout, &raytrace_shader, "fs_main", wgpu::TextureFormat::Rgba16Float);
+    let h_blur_pipeline = make_pipeline(&device, &post_pipeline_layout, &bloom_shader, "fs_horizontal_blur", wgpu::TextureFormat::Rgba16Float);
+    let v_blur_pipeline = make_pipeline(&device, &post_pipeline_layout, &bloom_shader, "fs_vertical_blur", wgpu::TextureFormat::Rgba16Float);
+    let composite_pipeline = make_pipeline(&device, &comp_pipeline_layout, &bloom_shader, "fs_composite", config.format);
+
+    let target_frame_time = std::time::Duration::from_secs_f32(1.0 / 60.0);
     let mut last_frame_time = Instant::now();
 
-    event_loop
-        .run(move |event, target| match event {
-            Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => target.exit(),
-            Event::WindowEvent { event: WindowEvent::Resized(new_size), .. } => {
-                config.width = new_size.width.max(1);
-                config.height = new_size.height.max(1);
-                surface.configure(&device, &config);
-            }
-            Event::WindowEvent {
-                event: WindowEvent::MouseInput { button: MouseButton::Left, state, .. },
-                ..
-            } => {
-                is_dragging = state == ElementState::Pressed;
-                if !is_dragging {
-                    last_mouse_pos = None;
-                }
-            }
-            Event::WindowEvent {
-                event: WindowEvent::CursorMoved { position, .. },
-                ..
-            } => {
-                if is_dragging {
-                    if let Some((last_x, last_y)) = last_mouse_pos {
-                        let dx = (position.x - last_x) as f32;
-                        let dy = (position.y - last_y) as f32;
-                        yaw += dx * 0.005;
-                        pitch = (pitch + dy * 0.005).clamp(-1.4, 1.4);
-                    }
-                    last_mouse_pos = Some((position.x, position.y));
-                }
-            }
-            Event::WindowEvent {
-                event: WindowEvent::MouseWheel { delta, .. },
-                ..
-            } => {
-                let scroll = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y,
-                    MouseScrollDelta::PixelDelta(pos) => pos.y as f32 * 0.05,
-                };
-                if scroll > 0.0 {
-                    camera_distance *= 0.9;
-                } else if scroll < 0.0 {
-                    camera_distance *= 1.1;
-                }
-                camera_distance = camera_distance.clamp(3.0, 80.0);
-            }
-            Event::AboutToWait => {
-                if last_frame_time.elapsed() >= target_frame_time {
-                    window.request_redraw();
-                }
-            }
-            Event::WindowEvent {
-                event: WindowEvent::RedrawRequested,
-                ..
-            } => {
-                last_frame_time = Instant::now();
-                let time = start_time.elapsed().as_secs_f32();
-                let aspect = config.width as f32 / config.height as f32;
+    event_loop.run(move |event, target| match event {
+        Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => target.exit(),
+        Event::WindowEvent { event: WindowEvent::Resized(new_size), .. } => {
+            width = new_size.width.max(1);
+            height = new_size.height.max(1);
+            config.width = width;
+            config.height = height;
+            surface.configure(&device, &config);
 
-                let ray_u = build_ray_uniforms(yaw, pitch, camera_distance, aspect, time);
-                queue.write_buffer(&ray_uniform_buffer, 0, bytemuck::bytes_of(&ray_u));
+            scene_view = scene_tex.create_view(&Default::default());
+            bloom_view_1 = bloom_tex_1.create_view(&Default::default());
+            bloom_view_2 = bloom_tex_2.create_view(&Default::default());
 
-                let frame = match surface.get_current_texture() {
-                    Ok(frame) => frame,
-                    Err(wgpu::SurfaceError::Outdated) => return,
-                    Err(e) => panic!("Surface error: {:?}", e),
-                };
+            h_blur_bg = make_post_bg(&device, &post_bgl, &scene_view, &sampler);
+            v_blur_bg = make_post_bg(&device, &post_bgl, &bloom_view_1, &sampler);
+            composite_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Composite BG"),
+                layout: &composite_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&scene_view) },
+                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&bloom_view_2) },
+                    wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&sampler) },
+                ],
+            });
+        }
+        Event::WindowEvent { event: WindowEvent::MouseInput { button: MouseButton::Left, state, .. }, .. } => {
+            is_dragging = state == ElementState::Pressed;
+            if !is_dragging { last_mouse_pos = None; }
+        }
+        Event::WindowEvent { event: WindowEvent::CursorMoved { position, .. }, .. } => {
+            if is_dragging {
+                if let Some((lx, ly)) = last_mouse_pos {
+                    yaw += (position.x - lx) as f32 * 0.005;
+                    pitch = (pitch + (position.y - ly) as f32 * 0.005).clamp(-1.4, 1.4);
+                }
+                last_mouse_pos = Some((position.x, position.y));
+            }
+        }
+        Event::WindowEvent { event: WindowEvent::MouseWheel { delta, .. }, .. } => {
+            let scroll = match delta { MouseScrollDelta::LineDelta(_, y) => y, MouseScrollDelta::PixelDelta(p) => p.y as f32 * 0.05 };
+            camera_distance = (if scroll > 0.0 { camera_distance * 0.9 } else { camera_distance * 1.1 }).clamp(3.0, 80.0);
+        }
+        Event::AboutToWait => {
+            if last_frame_time.elapsed() >= target_frame_time { window.request_redraw(); }
+        }
+        Event::WindowEvent { event: WindowEvent::RedrawRequested, .. } => {
+            last_frame_time = Instant::now();
+            let time = start_time.elapsed().as_secs_f32();
+            let aspect = width as f32 / height as f32;
 
-                let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
-                let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("Encoder"),
+            let ray_u = build_ray_uniforms(yaw, pitch, camera_distance, aspect, time);
+            queue.write_buffer(&ray_uniform_buffer, 0, bytemuck::bytes_of(&ray_u));
+
+            let frame = match surface.get_current_texture() {
+                Ok(f) => f,
+                Err(_) => return,
+            };
+            let surface_view = frame.texture.create_view(&Default::default());
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Pass Encoder") });
+
+            // Pass 1: Render black hole raytracer to offscreen HDR scene texture
+            {
+                let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Raytrace Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &scene_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
                 });
-
-                // Pure GR Raytracing Render Pass
-                {
-                    let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("Main Render Pass"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &view,
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.005, g: 0.008, b: 0.02, a: 1.0 }),
-                                store: wgpu::StoreOp::Store,
-                            },
-                        })],
-                        depth_stencil_attachment: None,
-                        timestamp_writes: None,
-                        occlusion_query_set: None,
-                    });
-
-                    rpass.set_pipeline(&raytrace_pipeline);
-                    rpass.set_bind_group(0, &ray_bind_group, &[]);
-                    rpass.draw(0..3, 0..1);
-                }
-
-                queue.submit(Some(encoder.finish()));
-                frame.present();
+                rpass.set_pipeline(&raytrace_pipeline);
+                rpass.set_bind_group(0, &ray_bg, &[]);
+                rpass.draw(0..3, 0..1);
             }
-            _ => {}
-        })
-        .unwrap();
+
+            // Pass 2: Horizontal Blur (extracts and expands highlights horizontally)
+            {
+                let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Horizontal Blur"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &bloom_view_1,
+                        resolve_target: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                rpass.set_pipeline(&h_blur_pipeline);
+                rpass.set_bind_group(0, &h_blur_bg, &[]);
+                rpass.draw(0..3, 0..1);
+            }
+
+            // Pass 3: Vertical Blur (smooths vertically to create camera lens glare)
+            {
+                let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Vertical Blur"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &bloom_view_2,
+                        resolve_target: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                rpass.set_pipeline(&v_blur_pipeline);
+                rpass.set_bind_group(0, &v_blur_bg, &[]);
+                rpass.draw(0..3, 0..1);
+            }
+
+            // Pass 4: Composite / Final Screen Output
+            {
+                let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Composite Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &surface_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                rpass.set_pipeline(&composite_pipeline);
+                rpass.set_bind_group(0, &composite_bg, &[]);
+                rpass.draw(0..3, 0..1);
+            }
+
+            queue.submit(Some(encoder.finish()));
+            frame.present();
+        }
+        _ => {}
+    }).unwrap();
 }
+
+// Keep helper math functions from original main.rs (transpose_4x4, build_ray_uniforms, perspective, lookat, invert_4x4)
 fn transpose_4x4(m: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
     [
         [m[0][0], m[1][0], m[2][0], m[3][0]],
@@ -283,19 +414,9 @@ fn lookat(eye: [f32; 3], target: [f32; 3], up: [f32; 3]) -> [[f32; 4]; 4] {
     let sub = |a: [f32; 3], b: [f32; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
     let norm = |v: [f32; 3]| {
         let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
-        if len > 0.0001 {
-            [v[0] / len, v[1] / len, v[2] / len]
-        } else {
-            [0.0, 0.0, 0.0]
-        }
+        if len > 0.0001 { [v[0] / len, v[1] / len, v[2] / len] } else { [0.0, 0.0, 0.0] }
     };
-    let cross = |a: [f32; 3], b: [f32; 3]| {
-        [
-            a[1] * b[2] - a[2] * b[1],
-            a[2] * b[0] - a[0] * b[2],
-            a[0] * b[1] - a[1] * b[0],
-        ]
-    };
+    let cross = |a: [f32; 3], b: [f32; 3]| [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
     let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
 
     let f = norm(sub(target, eye));
@@ -332,17 +453,14 @@ fn invert_4x4(m: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
     inv[0][1] = (-m[0][1] * c5 + m[0][2] * c4 - m[0][3] * c3) * det;
     inv[0][2] = (m[3][1] * s5 - m[3][2] * s4 + m[3][3] * s3) * det;
     inv[0][3] = (-m[2][1] * s5 + m[2][2] * s4 - m[2][3] * s3) * det;
-
     inv[1][0] = (-m[1][0] * c5 + m[1][2] * c2 - m[1][3] * c1) * det;
     inv[1][1] = (m[0][0] * c5 - m[0][2] * c2 + m[0][3] * c1) * det;
     inv[1][2] = (-m[3][0] * s5 + m[3][2] * s2 - m[3][3] * s1) * det;
     inv[1][3] = (m[2][0] * s5 - m[2][2] * s2 + m[2][3] * s1) * det;
-
     inv[2][0] = (m[1][0] * c4 - m[1][1] * c2 + m[1][3] * c0) * det;
     inv[2][1] = (-m[0][0] * c4 + m[0][1] * c2 - m[0][3] * c0) * det;
     inv[2][2] = (m[3][0] * s4 - m[3][1] * s2 + m[3][3] * s0) * det;
     inv[2][3] = (-m[2][0] * s4 + m[2][1] * s2 - m[2][3] * s0) * det;
-
     inv[3][0] = (-m[1][0] * c3 + m[1][1] * c1 - m[1][2] * c0) * det;
     inv[3][1] = (m[0][0] * c3 - m[0][1] * c1 + m[0][2] * c0) * det;
     inv[3][2] = (-m[3][0] * s3 + m[3][1] * s1 - m[3][2] * s0) * det;
