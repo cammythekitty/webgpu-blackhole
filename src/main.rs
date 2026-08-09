@@ -245,19 +245,6 @@ async fn render_tile(
     drop(data);
     staging_buffer.unmap();
 
-    drop(scene_view);
-    drop(scene_tex);
-    drop(bloom_view_1);
-    drop(bloom_tex_1);
-    drop(bloom_view_2);
-    drop(bloom_tex_2);
-    drop(output_view);
-    drop(output_tex);
-    drop(ray_uniform_buffer);
-    drop(composite_global_buffer);
-    drop(staging_buffer);
-    device.poll(wgpu::Maintain::Wait).panic_on_timeout();
-
     Ok(pixels)
 }
 

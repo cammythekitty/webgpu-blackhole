@@ -24,8 +24,13 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VOut {
         vec2<f32>(-1.0,  3.0)
     );
     var out: VOut;
+    
+    // 1. Draw the triangle so it fills the current tile's local texture
     out.position = vec4<f32>(pos[vi], 0.0, 1.0);
+    
+    // 2. Pass the mathematical global coordinate to the fragment shader for the ray math
     out.uv = pos[vi] * u.tile_scale + u.tile_offset;
+    
     return out;
 }
 
@@ -438,14 +443,14 @@ fn sample_accretion_disk(pos: vec3<f32>, vel: vec3<f32>) -> vec4<f32> {
 
     let beaming_factor = pow(clamp(doppler, 0.12, 3.8), 3.8);
 
-    let base_temp = 12.5 * pow(r_isco / r, 0.75);
-    let rs = 1.0; 
+    let base_temp = 8.0 * pow(r_isco / r, 0.75);
+    let rs = 2.0; 
     let grav_shift = sqrt(max(0.15, 1.0 - rs / r));
     let combined_shift = grav_shift * doppler;
     let effective_temp = base_temp * mix(1.0, combined_shift, 0.5);
 
     var color = blackbody(effective_temp);
-    color *= beaming_factor * grav_shift * 3.8;
+    color *= beaming_factor * grav_shift * 6.0;
 
     let scattering_albedo = 0.75;
     let scattering_phase = 0.85 + 0.25 * pow(max(0.0, dot(normalize(pitched_pos), -pitched_vel)), 2.0);
@@ -542,6 +547,7 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
     let inv_proj = transpose(u.inv_proj);
     let inv_view = transpose(u.inv_view);
 
+    // in.uv is already our global screen coordinate, no clipping needed!
     let target_pos = inv_proj * vec4<f32>(in.uv.x, in.uv.y, 1.0, 1.0);
     let ray_dir_view = normalize(target_pos.xyz / target_pos.w);
     var dir = normalize((inv_view * vec4<f32>(ray_dir_view, 0.0)).xyz);
@@ -550,7 +556,7 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
     let jitter = hash33(vec3<f32>(in.uv * 1000.0, u.time));
     pos += dir * (jitter * 0.005);
 
-    let rs = 1.0;
+    let rs = 2.0;
     var color = vec3<f32>(0.0);
     var transmittance = 1.0;
     var min_r = 1000.0;
@@ -600,6 +606,22 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
             if (transmittance < 0.005) { break; }
         }
 
+        // Volumetric light scattering past the black hole & accretion disk
+        let corona_r = sqrt(pos.x * pos.x + pos.z * pos.z);
+        let disk_plane_dist = abs(pos.y);
+        let in_corona = smoothstep(25.0, 4.0, corona_r) 
+                      * smoothstep(4.0, 0.0, disk_plane_dist) 
+                      * smoothstep(2.0, 8.0, corona_r);
+                      
+        let disk_lum = dot(disk_light_accum, vec3<f32>(0.2126, 0.7152, 0.0722));
+        let scatter_color = mix(
+            vec3<f32>(1.0, 0.7, 0.3), 
+            vec3<f32>(1.0, 0.5, 0.1), 
+            clamp(corona_r / 15.0, 0.0, 1.0)
+        );
+        
+        color += scatter_color * disk_lum * in_corona * 1.0 * transmittance * h_step;
+
         let dist_to_isco = abs(r - 3.0);
         inner_disk_proximity += exp(-dist_to_isco * 1.5) * h_step;
 
@@ -613,13 +635,10 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
         pos += dir * h_step;
     }
 
-    let disk_bloom = disk_light_accum * 0.35;
-    let isco_glare = vec3<f32>(1.0, 0.85, 0.5) * inner_disk_proximity * 0.08;
-
-    color += disk_bloom + isco_glare;
+    // color += disk_bloom + isco_glare;
 
     let luminance = dot(color, vec3<f32>(0.2126, 0.7152, 0.0722));
-    let bloom_threshold = 0.75;
+    let bloom_threshold = 0.3;
     let bloom_factor = smoothstep(bloom_threshold, bloom_threshold + 0.4, luminance);
     let bright_highlights = color * bloom_factor * 1.5;
 
