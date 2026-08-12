@@ -29,7 +29,7 @@ fn create_hdr_texture(device: &wgpu::Device, width: u32, height: u32, label: &st
         label: Some(label),
         size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
         mip_level_count: 1,
-        sample_count: 1,
+        sample_count: 1, // <-- Change from 1 to 4 for MSAA
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Rgba16Float,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
@@ -424,8 +424,9 @@ fn main() {
     let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
         address_mode_u: wgpu::AddressMode::ClampToEdge,
         address_mode_v: wgpu::AddressMode::ClampToEdge,
-        mag_filter: wgpu::FilterMode::Linear,
-        min_filter: wgpu::FilterMode::Linear,
+        mag_filter: wgpu::FilterMode::Linear, // <-- Linear prevents pixelation when scaling up
+        min_filter: wgpu::FilterMode::Linear, // <-- Linear prevents pixelation when scaling down
+        mipmap_filter: wgpu::FilterMode::Linear,
         ..Default::default()
     });
 
